@@ -32,7 +32,7 @@ This node takes an audio input and converts the voice using ElevenLabs' Speech-t
 | `api_key` | STRING | Yes | Your ElevenLabs API key (or set `ELEVENLABS_API_KEY` env var) |
 | `voice_id` | STRING | Yes | Target voice ID from ElevenLabs |
 | `model_id` | COMBO | No | Model to use (default: `eleven_multilingual_sts_v2`) |
-| `output_format` | COMBO | No | Output audio format (default: `mp3_44100_128`) |
+| `output_format` | COMBO | No | Output audio format (default: `pcm_44100`) |
 | `remove_background_noise` | BOOLEAN | No | Remove background noise from input (default: False) |
 
 #### Outputs
@@ -48,14 +48,12 @@ This node takes an audio input and converts the voice using ElevenLabs' Speech-t
 
 ### Available Output Formats
 
-- `mp3_44100_128` - MP3 at 44.1kHz, 128kbps (recommended)
-- `mp3_44100_192` - MP3 at 44.1kHz, 192kbps
-- `mp3_22050_32` - MP3 at 22.05kHz, 32kbps
-- `pcm_16000` - PCM at 16kHz
-- `pcm_22050` - PCM at 22.05kHz
+- `pcm_44100` - PCM at 44.1kHz (recommended)
 - `pcm_24000` - PCM at 24kHz
-- `pcm_44100` - PCM at 44.1kHz
-- `ulaw_8000` - uLaw at 8kHz
+- `pcm_22050` - PCM at 22.05kHz
+- `pcm_16000` - PCM at 16kHz
+
+> **Note:** Only PCM formats are supported to ensure compatibility across all platforms (ComfyDeploy, RunPod, local installations) without requiring additional audio codec dependencies.
 
 ## Getting Your ElevenLabs API Key
 
@@ -84,6 +82,15 @@ You can set your API key as an environment variable instead of entering it in th
 ```bash
 export ELEVENLABS_API_KEY="your-api-key-here"
 ```
+
+## Compatibility
+
+This node is designed to work across all platforms:
+- ComfyDeploy
+- RunPod
+- Local ComfyUI installations
+
+It uses only standard Python libraries (no torchaudio or scipy required for audio I/O) to avoid codec dependency issues.
 
 ## License
 

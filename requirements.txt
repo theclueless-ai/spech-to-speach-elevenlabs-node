@@ -1,5 +1,2 @@
 elevenlabs>=1.0.0
-torch
-torchaudio
-scipy
 numpy

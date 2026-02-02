@@ -5,6 +5,7 @@ Uses the ElevenLabs Speech-to-Speech API to transform voices in audio files.
 
 import os
 import tempfile
+import struct
 from io import BytesIO
 
 class ElevenLabsVoiceChanger:
@@ -17,16 +18,21 @@ class ElevenLabsVoiceChanger:
         "eleven_english_sts_v2",
     ]
 
+    # Only PCM formats to avoid codec dependencies
     OUTPUT_FORMATS = [
-        "mp3_44100_128",
-        "mp3_44100_192",
-        "mp3_22050_32",
-        "pcm_16000",
-        "pcm_22050",
-        "pcm_24000",
         "pcm_44100",
-        "ulaw_8000",
+        "pcm_24000",
+        "pcm_22050",
+        "pcm_16000",
     ]
+
+    # Map format to sample rate
+    FORMAT_SAMPLE_RATES = {
+        "pcm_44100": 44100,
+        "pcm_24000": 24000,
+        "pcm_22050": 22050,
+        "pcm_16000": 16000,
+    }
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -47,7 +53,7 @@ class ElevenLabsVoiceChanger:
                     "default": "eleven_multilingual_sts_v2",
                 }),
                 "output_format": (cls.OUTPUT_FORMATS, {
-                    "default": "mp3_44100_128",
+                    "default": "pcm_44100",
                 }),
                 "remove_background_noise": ("BOOLEAN", {
                     "default": False,
@@ -61,7 +67,7 @@ class ElevenLabsVoiceChanger:
     CATEGORY = "audio/ElevenLabs"
 
     def convert_voice(self, audio, api_key, voice_id, model_id="eleven_multilingual_sts_v2",
-                      output_format="mp3_44100_128", remove_background_noise=False):
+                      output_format="pcm_44100", remove_background_noise=False):
         """
         Convert the voice in the input audio using ElevenLabs Speech-to-Speech API.
 
@@ -70,7 +76,7 @@ class ElevenLabsVoiceChanger:
             api_key: ElevenLabs API key
             voice_id: Target voice ID from ElevenLabs
             model_id: Model to use for conversion
-            output_format: Output audio format
+            output_format: Output audio format (PCM only)
             remove_background_noise: Whether to remove background noise
 
         Returns:
@@ -86,10 +92,9 @@ class ElevenLabsVoiceChanger:
         try:
             import torch
             import numpy as np
-            from scipy.io import wavfile
         except ImportError:
             raise ImportError(
-                "Please install scipy and numpy: pip install scipy numpy"
+                "Please install torch and numpy"
             )
 
         if not api_key:
@@ -112,77 +117,122 @@ class ElevenLabsVoiceChanger:
             # Shape is (batch, channels, samples) - take first batch
             waveform = waveform[0]
 
-        # Convert to numpy array for scipy
+        # Convert to mono if stereo (ElevenLabs works better with mono)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        # Convert to numpy array for WAV creation
         # waveform shape: (channels, samples) -> transpose to (samples, channels)
         waveform_np = waveform.cpu().numpy().T
 
         # Convert float32 [-1, 1] to int16 for WAV
-        waveform_int16 = (waveform_np * 32767).astype(np.int16)
+        waveform_int16 = (np.clip(waveform_np, -1, 1) * 32767).astype(np.int16)
 
-        # Save to temporary WAV file for API
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            tmp_path = tmp_file.name
+        # Create WAV file manually without scipy (to ensure compatibility)
+        audio_bytes = self._create_wav_bytes(waveform_int16, sample_rate)
+        audio_data = BytesIO(audio_bytes)
 
-        try:
-            # Save waveform to WAV using scipy
-            wavfile.write(tmp_path, sample_rate, waveform_int16)
+        # Call ElevenLabs Speech-to-Speech API
+        audio_stream = client.speech_to_speech.convert(
+            voice_id=voice_id,
+            audio=audio_data,
+            model_id=model_id,
+            output_format=output_format,
+            remove_background_noise=remove_background_noise,
+        )
 
-            # Read file and send to API
-            with open(tmp_path, "rb") as f:
-                audio_data = BytesIO(f.read())
+        # Collect the audio stream into bytes
+        response_bytes = b"".join(audio_stream)
 
-            # Call ElevenLabs Speech-to-Speech API
-            audio_stream = client.speech_to_speech.convert(
-                voice_id=voice_id,
-                audio=audio_data,
-                model_id=model_id,
-                output_format=output_format,
-                remove_background_noise=remove_background_noise,
-            )
+        # Get the sample rate for the output format
+        output_sample_rate = self.FORMAT_SAMPLE_RATES.get(output_format, 44100)
 
-            # Collect the audio stream into bytes
-            audio_bytes = b"".join(audio_stream)
+        # Convert PCM bytes to tensor
+        # ElevenLabs PCM output is 16-bit signed integer, mono
+        converted_waveform = self._pcm_bytes_to_tensor(response_bytes, output_sample_rate)
 
-            # Determine file extension based on output format
-            if output_format.startswith("mp3"):
-                suffix = ".mp3"
-            elif output_format.startswith("pcm"):
-                suffix = ".wav"
-            else:
-                suffix = ".wav"
+        # Return in ComfyUI AUDIO format
+        output_audio = {
+            "waveform": converted_waveform,
+            "sample_rate": output_sample_rate,
+        }
 
-            # Save response to temporary file for loading
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as out_file:
-                out_path = out_file.name
-                out_file.write(audio_bytes)
+        return (output_audio,)
 
-            try:
-                # Load the converted audio using torchaudio
-                # Import here to handle the response audio
-                import torchaudio
-                converted_waveform, converted_sample_rate = torchaudio.load(out_path)
+    def _create_wav_bytes(self, audio_data, sample_rate):
+        """
+        Create WAV file bytes from audio data without external dependencies.
 
-                # Add batch dimension for ComfyUI format
-                if converted_waveform.dim() == 2:
-                    converted_waveform = converted_waveform.unsqueeze(0)
+        Args:
+            audio_data: numpy array of int16 audio samples (samples, channels)
+            sample_rate: sample rate in Hz
 
-                # Return in ComfyUI AUDIO format
-                output_audio = {
-                    "waveform": converted_waveform,
-                    "sample_rate": converted_sample_rate,
-                }
+        Returns:
+            bytes: WAV file content
+        """
+        # Ensure audio_data is 2D
+        if audio_data.ndim == 1:
+            audio_data = audio_data.reshape(-1, 1)
 
-                return (output_audio,)
+        num_samples, num_channels = audio_data.shape
+        bytes_per_sample = 2  # 16-bit
 
-            finally:
-                # Clean up output temp file
-                if os.path.exists(out_path):
-                    os.unlink(out_path)
+        # WAV header
+        wav_header = BytesIO()
 
-        finally:
-            # Clean up input temp file
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+        # RIFF header
+        wav_header.write(b'RIFF')
+        data_size = num_samples * num_channels * bytes_per_sample
+        file_size = 36 + data_size  # 36 bytes for header + data
+        wav_header.write(struct.pack('<I', file_size))
+        wav_header.write(b'WAVE')
+
+        # fmt chunk
+        wav_header.write(b'fmt ')
+        wav_header.write(struct.pack('<I', 16))  # fmt chunk size
+        wav_header.write(struct.pack('<H', 1))   # audio format (1 = PCM)
+        wav_header.write(struct.pack('<H', num_channels))
+        wav_header.write(struct.pack('<I', sample_rate))
+        byte_rate = sample_rate * num_channels * bytes_per_sample
+        wav_header.write(struct.pack('<I', byte_rate))
+        block_align = num_channels * bytes_per_sample
+        wav_header.write(struct.pack('<H', block_align))
+        wav_header.write(struct.pack('<H', bytes_per_sample * 8))  # bits per sample
+
+        # data chunk
+        wav_header.write(b'data')
+        wav_header.write(struct.pack('<I', data_size))
+
+        # Combine header and data
+        wav_bytes = wav_header.getvalue() + audio_data.tobytes()
+
+        return wav_bytes
+
+    def _pcm_bytes_to_tensor(self, pcm_bytes, sample_rate):
+        """
+        Convert raw PCM bytes to a PyTorch tensor.
+
+        Args:
+            pcm_bytes: Raw PCM audio bytes (16-bit signed integer, mono)
+            sample_rate: Sample rate of the audio
+
+        Returns:
+            torch.Tensor: Audio tensor in ComfyUI format (batch, channels, samples)
+        """
+        import torch
+        import numpy as np
+
+        # Convert bytes to numpy array (16-bit signed integer)
+        audio_array = np.frombuffer(pcm_bytes, dtype=np.int16)
+
+        # Convert to float32 [-1, 1]
+        audio_float = audio_array.astype(np.float32) / 32767.0
+
+        # Convert to tensor and add dimensions
+        # Shape: (samples,) -> (1, 1, samples) for (batch, channels, samples)
+        waveform = torch.from_numpy(audio_float).unsqueeze(0).unsqueeze(0)
+
+        return waveform
 
 
 # Node mappings for ComfyUI
