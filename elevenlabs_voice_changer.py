@@ -84,11 +84,12 @@ class ElevenLabsVoiceChanger:
             )
 
         try:
-            import torchaudio
             import torch
+            import numpy as np
+            from scipy.io import wavfile
         except ImportError:
             raise ImportError(
-                "Please install torchaudio: pip install torchaudio"
+                "Please install scipy and numpy: pip install scipy numpy"
             )
 
         if not api_key:
@@ -111,13 +112,20 @@ class ElevenLabsVoiceChanger:
             # Shape is (batch, channels, samples) - take first batch
             waveform = waveform[0]
 
-        # Save to temporary file for API
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_file:
+        # Convert to numpy array for scipy
+        # waveform shape: (channels, samples) -> transpose to (samples, channels)
+        waveform_np = waveform.cpu().numpy().T
+
+        # Convert float32 [-1, 1] to int16 for WAV
+        waveform_int16 = (waveform_np * 32767).astype(np.int16)
+
+        # Save to temporary WAV file for API
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
             tmp_path = tmp_file.name
 
         try:
-            # Save waveform to MP3
-            torchaudio.save(tmp_path, waveform, sample_rate, format="mp3")
+            # Save waveform to WAV using scipy
+            wavfile.write(tmp_path, sample_rate, waveform_int16)
 
             # Read file and send to API
             with open(tmp_path, "rb") as f:
@@ -135,13 +143,23 @@ class ElevenLabsVoiceChanger:
             # Collect the audio stream into bytes
             audio_bytes = b"".join(audio_stream)
 
+            # Determine file extension based on output format
+            if output_format.startswith("mp3"):
+                suffix = ".mp3"
+            elif output_format.startswith("pcm"):
+                suffix = ".wav"
+            else:
+                suffix = ".wav"
+
             # Save response to temporary file for loading
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as out_file:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as out_file:
                 out_path = out_file.name
                 out_file.write(audio_bytes)
 
             try:
-                # Load the converted audio
+                # Load the converted audio using torchaudio
+                # Import here to handle the response audio
+                import torchaudio
                 converted_waveform, converted_sample_rate = torchaudio.load(out_path)
 
                 # Add batch dimension for ComfyUI format
