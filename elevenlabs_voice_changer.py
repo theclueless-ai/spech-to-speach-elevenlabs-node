@@ -141,7 +141,8 @@ class ElevenLabsVoiceChanger:
 
         # Convert response to tensor based on format
         if output_format.startswith("mp3"):
-            converted_waveform = self._mp3_bytes_to_tensor(response_bytes)
+            converted_waveform, actual_sample_rate = self._mp3_bytes_to_tensor(response_bytes)
+            output_sample_rate = actual_sample_rate
         else:
             converted_waveform = self._pcm_bytes_to_tensor(response_bytes, output_sample_rate)
 
@@ -194,39 +195,39 @@ class ElevenLabsVoiceChanger:
         return waveform
 
     def _mp3_bytes_to_tensor(self, mp3_bytes):
-        """Convert MP3 bytes to a PyTorch tensor using pydub."""
+        """Convert MP3 bytes to a PyTorch tensor using miniaudio (no ffmpeg needed)."""
         import torch
         import numpy as np
 
         try:
-            from pydub import AudioSegment
+            import miniaudio
         except ImportError:
             raise ImportError(
-                "pydub is required for MP3 decoding. Install it with: pip install pydub"
+                "miniaudio is required for MP3 decoding. Install it with: pip install miniaudio"
             )
 
-        # Load MP3 from bytes
-        audio_segment = AudioSegment.from_mp3(BytesIO(mp3_bytes))
+        # Decode MP3 bytes to raw audio
+        decoded = miniaudio.decode(mp3_bytes, output_format=miniaudio.SampleFormat.SIGNED16)
 
-        # Convert to mono if stereo
-        if audio_segment.channels > 1:
-            audio_segment = audio_segment.set_channels(1)
+        # Get audio properties
+        sample_rate = decoded.sample_rate
+        num_channels = decoded.nchannels
 
-        # Get raw audio data as numpy array
-        samples = np.array(audio_segment.get_array_of_samples())
+        # Convert to numpy array
+        audio_array = np.array(decoded.samples, dtype=np.int16)
+
+        # If stereo, convert to mono by averaging channels
+        if num_channels > 1:
+            audio_array = audio_array.reshape(-1, num_channels)
+            audio_array = audio_array.mean(axis=1).astype(np.int16)
 
         # Normalize to float32 [-1, 1]
-        if audio_segment.sample_width == 2:  # 16-bit
-            audio_float = samples.astype(np.float32) / 32767.0
-        elif audio_segment.sample_width == 1:  # 8-bit
-            audio_float = (samples.astype(np.float32) - 128) / 128.0
-        else:  # 32-bit
-            audio_float = samples.astype(np.float32) / 2147483647.0
+        audio_float = audio_array.astype(np.float32) / 32767.0
 
         # Convert to tensor: (1, 1, samples) for (batch, channels, samples)
         waveform = torch.from_numpy(audio_float).unsqueeze(0).unsqueeze(0)
 
-        return waveform
+        return waveform, sample_rate
 
 
 # Node mappings for ComfyUI
