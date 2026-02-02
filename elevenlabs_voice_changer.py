@@ -18,8 +18,11 @@ class ElevenLabsVoiceChanger:
         "eleven_english_sts_v2",
     ]
 
-    # Only PCM formats to avoid codec dependencies
+    # MP3 formats (available for all tiers) + PCM formats (Pro tier only)
     OUTPUT_FORMATS = [
+        "mp3_44100_128",
+        "mp3_44100_192",
+        "mp3_22050_32",
         "pcm_44100",
         "pcm_24000",
         "pcm_22050",
@@ -28,6 +31,9 @@ class ElevenLabsVoiceChanger:
 
     # Map format to sample rate
     FORMAT_SAMPLE_RATES = {
+        "mp3_44100_128": 44100,
+        "mp3_44100_192": 44100,
+        "mp3_22050_32": 22050,
         "pcm_44100": 44100,
         "pcm_24000": 24000,
         "pcm_22050": 22050,
@@ -53,7 +59,7 @@ class ElevenLabsVoiceChanger:
                     "default": "eleven_multilingual_sts_v2",
                 }),
                 "output_format": (cls.OUTPUT_FORMATS, {
-                    "default": "pcm_44100",
+                    "default": "mp3_44100_128",
                 }),
                 "remove_background_noise": ("BOOLEAN", {
                     "default": False,
@@ -67,20 +73,9 @@ class ElevenLabsVoiceChanger:
     CATEGORY = "audio/ElevenLabs"
 
     def convert_voice(self, audio, api_key, voice_id, model_id="eleven_multilingual_sts_v2",
-                      output_format="pcm_44100", remove_background_noise=False):
+                      output_format="mp3_44100_128", remove_background_noise=False):
         """
         Convert the voice in the input audio using ElevenLabs Speech-to-Speech API.
-
-        Args:
-            audio: Input audio (ComfyUI AUDIO type - dict with 'waveform' and 'sample_rate')
-            api_key: ElevenLabs API key
-            voice_id: Target voice ID from ElevenLabs
-            model_id: Model to use for conversion
-            output_format: Output audio format (PCM only)
-            remove_background_noise: Whether to remove background noise
-
-        Returns:
-            tuple: (audio_output,) - The converted audio
         """
         try:
             from elevenlabs.client import ElevenLabs
@@ -108,27 +103,24 @@ class ElevenLabsVoiceChanger:
         client = ElevenLabs(api_key=api_key)
 
         # Convert ComfyUI audio format to bytes
-        # ComfyUI AUDIO type is a dict with 'waveform' (tensor) and 'sample_rate' (int)
         waveform = audio["waveform"]
         sample_rate = audio["sample_rate"]
 
         # Ensure waveform is 2D (channels, samples)
         if waveform.dim() == 3:
-            # Shape is (batch, channels, samples) - take first batch
             waveform = waveform[0]
 
-        # Convert to mono if stereo (ElevenLabs works better with mono)
+        # Convert to mono if stereo
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
         # Convert to numpy array for WAV creation
-        # waveform shape: (channels, samples) -> transpose to (samples, channels)
         waveform_np = waveform.cpu().numpy().T
 
         # Convert float32 [-1, 1] to int16 for WAV
         waveform_int16 = (np.clip(waveform_np, -1, 1) * 32767).astype(np.int16)
 
-        # Create WAV file manually without scipy (to ensure compatibility)
+        # Create WAV file manually
         audio_bytes = self._create_wav_bytes(waveform_int16, sample_rate)
         audio_data = BytesIO(audio_bytes)
 
@@ -147,9 +139,11 @@ class ElevenLabsVoiceChanger:
         # Get the sample rate for the output format
         output_sample_rate = self.FORMAT_SAMPLE_RATES.get(output_format, 44100)
 
-        # Convert PCM bytes to tensor
-        # ElevenLabs PCM output is 16-bit signed integer, mono
-        converted_waveform = self._pcm_bytes_to_tensor(response_bytes, output_sample_rate)
+        # Convert response to tensor based on format
+        if output_format.startswith("mp3"):
+            converted_waveform = self._mp3_bytes_to_tensor(response_bytes)
+        else:
+            converted_waveform = self._pcm_bytes_to_tensor(response_bytes, output_sample_rate)
 
         # Return in ComfyUI AUDIO format
         output_audio = {
@@ -160,76 +154,76 @@ class ElevenLabsVoiceChanger:
         return (output_audio,)
 
     def _create_wav_bytes(self, audio_data, sample_rate):
-        """
-        Create WAV file bytes from audio data without external dependencies.
-
-        Args:
-            audio_data: numpy array of int16 audio samples (samples, channels)
-            sample_rate: sample rate in Hz
-
-        Returns:
-            bytes: WAV file content
-        """
-        # Ensure audio_data is 2D
+        """Create WAV file bytes from audio data."""
         if audio_data.ndim == 1:
             audio_data = audio_data.reshape(-1, 1)
 
         num_samples, num_channels = audio_data.shape
-        bytes_per_sample = 2  # 16-bit
+        bytes_per_sample = 2
 
-        # WAV header
         wav_header = BytesIO()
-
-        # RIFF header
         wav_header.write(b'RIFF')
         data_size = num_samples * num_channels * bytes_per_sample
-        file_size = 36 + data_size  # 36 bytes for header + data
+        file_size = 36 + data_size
         wav_header.write(struct.pack('<I', file_size))
         wav_header.write(b'WAVE')
-
-        # fmt chunk
         wav_header.write(b'fmt ')
-        wav_header.write(struct.pack('<I', 16))  # fmt chunk size
-        wav_header.write(struct.pack('<H', 1))   # audio format (1 = PCM)
+        wav_header.write(struct.pack('<I', 16))
+        wav_header.write(struct.pack('<H', 1))
         wav_header.write(struct.pack('<H', num_channels))
         wav_header.write(struct.pack('<I', sample_rate))
         byte_rate = sample_rate * num_channels * bytes_per_sample
         wav_header.write(struct.pack('<I', byte_rate))
         block_align = num_channels * bytes_per_sample
         wav_header.write(struct.pack('<H', block_align))
-        wav_header.write(struct.pack('<H', bytes_per_sample * 8))  # bits per sample
-
-        # data chunk
+        wav_header.write(struct.pack('<H', bytes_per_sample * 8))
         wav_header.write(b'data')
         wav_header.write(struct.pack('<I', data_size))
 
-        # Combine header and data
-        wav_bytes = wav_header.getvalue() + audio_data.tobytes()
-
-        return wav_bytes
+        return wav_header.getvalue() + audio_data.tobytes()
 
     def _pcm_bytes_to_tensor(self, pcm_bytes, sample_rate):
-        """
-        Convert raw PCM bytes to a PyTorch tensor.
-
-        Args:
-            pcm_bytes: Raw PCM audio bytes (16-bit signed integer, mono)
-            sample_rate: Sample rate of the audio
-
-        Returns:
-            torch.Tensor: Audio tensor in ComfyUI format (batch, channels, samples)
-        """
+        """Convert raw PCM bytes to a PyTorch tensor."""
         import torch
         import numpy as np
 
-        # Convert bytes to numpy array (16-bit signed integer)
         audio_array = np.frombuffer(pcm_bytes, dtype=np.int16)
-
-        # Convert to float32 [-1, 1]
         audio_float = audio_array.astype(np.float32) / 32767.0
+        waveform = torch.from_numpy(audio_float).unsqueeze(0).unsqueeze(0)
 
-        # Convert to tensor and add dimensions
-        # Shape: (samples,) -> (1, 1, samples) for (batch, channels, samples)
+        return waveform
+
+    def _mp3_bytes_to_tensor(self, mp3_bytes):
+        """Convert MP3 bytes to a PyTorch tensor using pydub."""
+        import torch
+        import numpy as np
+
+        try:
+            from pydub import AudioSegment
+        except ImportError:
+            raise ImportError(
+                "pydub is required for MP3 decoding. Install it with: pip install pydub"
+            )
+
+        # Load MP3 from bytes
+        audio_segment = AudioSegment.from_mp3(BytesIO(mp3_bytes))
+
+        # Convert to mono if stereo
+        if audio_segment.channels > 1:
+            audio_segment = audio_segment.set_channels(1)
+
+        # Get raw audio data as numpy array
+        samples = np.array(audio_segment.get_array_of_samples())
+
+        # Normalize to float32 [-1, 1]
+        if audio_segment.sample_width == 2:  # 16-bit
+            audio_float = samples.astype(np.float32) / 32767.0
+        elif audio_segment.sample_width == 1:  # 8-bit
+            audio_float = (samples.astype(np.float32) - 128) / 128.0
+        else:  # 32-bit
+            audio_float = samples.astype(np.float32) / 2147483647.0
+
+        # Convert to tensor: (1, 1, samples) for (batch, channels, samples)
         waveform = torch.from_numpy(audio_float).unsqueeze(0).unsqueeze(0)
 
         return waveform
